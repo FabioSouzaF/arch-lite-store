@@ -6,6 +6,7 @@ Layout em cada aba:   ui/tabs/
 Botões inline:        ui/package_item.py
 I/O pesada:           workers/
 """
+import shutil
 import subprocess
 
 from PySide6.QtWidgets import (
@@ -45,8 +46,14 @@ class ArchStore(QMainWindow):
             self.setWindowIcon(QIcon(str(LOGO_ICON)))
 
         # Dicts para rastrear widgets inline → atualizar ícones baixados
-        self._search_widgets: dict[str, PackageItemWidget] = {}
+        self._search_widgets:    dict[str, PackageItemWidget] = {}
         self._installed_widgets: dict[str, PackageItemWidget] = {}
+
+        # Referência ao IconWorker ativo — evita dois workers simultâneos
+        self._icon_worker: IconWorker | None = None
+
+        # Terminal preferêncial (Bug #4: verifica disponibilidade em tempo de execução)
+        self._terminal = self._detectar_terminal()
 
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
@@ -94,6 +101,36 @@ class ArchStore(QMainWindow):
         mt.btn_cache.clicked.connect(self.limpar_cache)
         mt.btn_orfaos.clicked.connect(self.limpar_orfaos)
         mt.btn_flatpak.clicked.connect(self.limpar_flatpaks)
+
+    # ================================================================== #
+    # Utilitários de sistema                                               #
+    # ================================================================== #
+
+    @staticmethod
+    def _detectar_terminal() -> str | None:
+        """Retorna o primeiro terminal disponível no PATH, ou None."""
+        for t in ("xterm", "lxterminal", "alacritty", "konsole", "xfce4-terminal"):
+            if shutil.which(t):
+                return t
+        return None
+
+    def _executar_no_terminal(self, comando: str):
+        """Roda um comando shell num terminal externo.
+
+        Lança QMessageBox de erro amigável se nenhum terminal for encontrado
+        (Bug #4: crash silencioso quando xterm não está instalado).
+        """
+        if not self._terminal:
+            QMessageBox.critical(
+                self, "Terminal não encontrado",
+                "Nenhum terminal compatível foi encontrado no sistema.\n"
+                "Instale um dos seguintes: xterm, lxterminal, alacritty, konsole.",
+            )
+            return
+        subprocess.run([
+            self._terminal, "-e",
+            f"{comando}; echo '\nConcluído. Pressione ENTER para fechar...'; read",
+        ])
 
     # ================================================================== #
     # Aba: Buscar                                                          #
@@ -167,12 +204,14 @@ class ArchStore(QMainWindow):
         )
 
     def filtrar_instalados(self, texto: str):
+        # Bug #3: termo vazio mostra todos os itens
         termo = texto.lower().strip()
         lista = self.installed_tab.installed_list
         for i in range(lista.count()):
             item   = lista.item(i)
             widget = lista.itemWidget(item)
             nome   = widget.pacote["nome"] if isinstance(widget, PackageItemWidget) else ""
+            # Oculta somente se há termo E o nome não bate
             item.setHidden(bool(termo) and termo not in nome.lower())
 
     # ================================================================== #
@@ -215,16 +254,11 @@ class ArchStore(QMainWindow):
         )
         if resp != QMessageBox.Yes:
             return
-        try:
-            subprocess.run([
-                "xterm", "-e",
-                "yay -Syu; echo '\n--- Flatpaks ---'; flatpak update; "
-                "echo '\nConcluído. ENTER para fechar...'; read",
-            ])
-            self.updates_tab.update_list.clear()
-            self.updates_tab.sys_update_button.setEnabled(False)
-        except Exception as exc:
-            QMessageBox.critical(self, "Erro", str(exc))
+        self._executar_no_terminal(
+            "yay -Syu; echo '\n--- Flatpaks ---'; flatpak update"
+        )
+        self.updates_tab.update_list.clear()
+        self.updates_tab.sys_update_button.setEnabled(False)
 
     # ================================================================== #
     # Aba: Manutenção                                                      #
@@ -236,10 +270,7 @@ class ArchStore(QMainWindow):
             "Remove pacotes antigos do cache, liberando espaço.\nDeseja continuar?",
             QMessageBox.Yes | QMessageBox.No,
         ) == QMessageBox.Yes:
-            subprocess.run([
-                "xterm", "-e",
-                "sudo pacman -Sc; echo '\nConcluído. ENTER para fechar...'; read",
-            ])
+            self._executar_no_terminal("sudo pacman -Sc")
 
     def limpar_orfaos(self):
         try:
@@ -258,11 +289,9 @@ class ArchStore(QMainWindow):
                 "Foram encontrados pacotes órfãos.\nDeseja removê-los agora?",
                 QMessageBox.Yes | QMessageBox.No,
             ) == QMessageBox.Yes:
-                comando = f"sudo pacman -Rns {orfaos.replace(chr(10), ' ')}"
-                subprocess.run([
-                    "xterm", "-e",
-                    f"{comando}; echo '\nConcluído. ENTER para fechar...'; read",
-                ])
+                self._executar_no_terminal(
+                    f"sudo pacman -Rns {orfaos.replace(chr(10), ' ')}"
+                )
                 self.carregar_instalados()
         except Exception as exc:
             QMessageBox.critical(self, "Erro", f"Erro ao verificar órfãos: {exc}")
@@ -273,10 +302,7 @@ class ArchStore(QMainWindow):
             "Remove bibliotecas Flatpak sem uso.\nDeseja continuar?",
             QMessageBox.Yes | QMessageBox.No,
         ) == QMessageBox.Yes:
-            subprocess.run([
-                "xterm", "-e",
-                "flatpak uninstall --unused; echo '\nConcluído. ENTER para fechar...'; read",
-            ])
+            self._executar_no_terminal("flatpak uninstall --unused")
 
     # ================================================================== #
     # Helpers partilhados                                                  #
@@ -303,6 +329,8 @@ class ArchStore(QMainWindow):
                 widgets_dict[pacote["nome"]] = widget
 
         if buscar_icones:
+            # Bug #2: guarda referência e desconecta worker anterior
+            self._cancelar_icon_worker()
             self._icon_worker = IconWorker(dados)
             self._icon_worker.icon_ready.connect(self._aplicar_icone_baixado)
             self._icon_worker.status_update.connect(
@@ -310,13 +338,22 @@ class ArchStore(QMainWindow):
             )
             self._icon_worker.start()
 
+    def _cancelar_icon_worker(self):
+        """Para o IconWorker anterior antes de iniciar um novo (Bug #2)."""
+        if self._icon_worker and self._icon_worker.isRunning():
+            self._icon_worker.quit()
+            self._icon_worker.wait(200)  # espera até 200ms, não bloqueia a UI
+            self._icon_worker = None
+
     def _aplicar_icone_baixado(self, nome: str, image_bytes: bytes):
-        """Atualiza ícone no widget inline após download."""
-        widget = self._search_widgets.get(nome)
-        if widget:
-            pixmap = QPixmap()
-            pixmap.loadFromData(image_bytes)
-            widget.set_icon(pixmap)
+        """Atualiza ícone em ambas as listas (Bug #1: instalados também)."""
+        pixmap = QPixmap()
+        pixmap.loadFromData(image_bytes)
+        # Procura em busca e em instalados
+        for widgets_dict in (self._search_widgets, self._installed_widgets):
+            widget = widgets_dict.get(nome)
+            if widget:
+                widget.set_icon(pixmap)
 
     def _on_info_requested(self, pacote: dict):
         """Abre dialog de detalhes a partir do botão Info inline."""
@@ -342,11 +379,6 @@ class ArchStore(QMainWindow):
         ) != QMessageBox.Yes:
             return
 
-        try:
-            subprocess.run([
-                "xterm", "-e",
-                f"{comando}; echo '\nConcluído. ENTER...'; read",
-            ])
-            self.carregar_instalados()
-        except Exception as exc:
-            QMessageBox.critical(self, "Erro", str(exc))
+        # Bug #4: usa _executar_no_terminal que já valida o terminal
+        self._executar_no_terminal(comando)
+        self.carregar_instalados()
