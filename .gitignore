@@ -1,0 +1,20 @@
+# Cache do Docker Compose
+.cache/
+
+# Bytecode Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Arquivos de edição do GIMP
+*.xcf
+
+# Backup do monólito original
+*.bak
+
+# Arquivos de IDE
+.vscode/
+.idea/
+
+# Variáveis de ambiente
+.env

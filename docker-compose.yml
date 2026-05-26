@@ -1,0 +1,23 @@
+services:
+  arch-store:
+    build: .
+    container_name: arch_store_test
+    privileged: true 
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+      - DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+      - QT_QPA_PLATFORM=xcb
+      # 1. Ajuda o Qt a localizar a pasta de ícones Adwaita
+      - XDG_CURRENT_DESKTOP=GNOME 
+    volumes:
+      - ./:/app
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ./.cache/pacman:/var/cache/pacman/pkg
+      - ./.cache/yay:/home/devuser/.cache/yay
+      # 2. Altere o caminho interno para o diretório local do usuário devuser
+      - ./.cache/flatpak:/home/devuser/.local/share/flatpak 
+    network_mode: host
+    
+    # 3. Remova o sudo e direcione o repositório e o appstream estritamente para o usuário
+    command: sh -c "flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo && flatpak update --appstream --user -y && python -m arch_lite_store"
